@@ -142,6 +142,9 @@ async fn list(State(st): State<Shared>) -> Json<Value> {
                 "serial": p.cfg.serial,
                 "model": p.cfg.model,
                 "connected": p.live.connected.load(Ordering::Acquire),
+                // Serial read from the printer's certificate when the configured
+                // one is wrong, so clients can correct their record.
+                "detected_serial": p.live.detected_serial.lock().unwrap().clone(),
             })
         })
         .collect();
@@ -568,6 +571,7 @@ mod tests {
         let (_, body) = call(&app, "GET", "/printers", Some("tok")).await;
         assert_eq!(body["printers"][0]["id"], "p1s");
         assert!(!body.to_string().contains("secret99"));
+        assert!(body["printers"][0]["detected_serial"].is_null());
         // Not connected: commands are refused, not queued.
         assert_eq!(
             call(&app, "POST", "/printers/p1s/pause", Some("tok"))
