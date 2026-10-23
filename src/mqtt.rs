@@ -23,6 +23,13 @@ const MAX_BACKOFF: Duration = Duration::from_secs(60);
 pub struct Live {
     pub state: Mutex<Value>,
     pub connected: AtomicBool,
+    /// Why the last connect attempt failed; cleared on connect. Shown as the
+    /// status `message` while offline so a failure is never silent.
+    pub last_error: Mutex<Option<String>>,
+    /// The serial read from the printer's TLS certificate when it differs
+    /// from the configured one. Topics use it instead: a wrong serial makes
+    /// the printer drop the connection right after login.
+    pub detected_serial: Mutex<Option<String>>,
     client: Mutex<Option<AsyncClient>>,
     seq: AtomicU64,
 }
@@ -42,6 +49,12 @@ impl Live {
     /// and replay it after reconnect, and a `stop` delivered minutes late is
     /// worse than an error now.
     pub fn publish(&self, serial: &str, payload: &Value) -> Result<(), CommandError> {
+        let serial = self
+            .detected_serial
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| serial.to_owned());
         if !self.connected.load(Ordering::Acquire) {
             return Err(CommandError::Offline);
         }
@@ -85,15 +98,19 @@ async fn run(id: String, cfg: PrinterConfig, live: Arc<Live>) {
     opts.set_keep_alive(Duration::from_secs(30));
     // A full pushall report with AMS data runs to tens of KB.
     opts.set_max_packet_size(4 * 1024 * 1024, 256 * 1024);
+    let cert_cn: tls::CnSink = Default::default();
     opts.set_transport(Transport::tls_with_config(TlsConfiguration::Rustls(
-        tls::client_config(),
+        tls::client_config_with_cn(cert_cn.clone()),
     )));
 
     let (client, mut events) = AsyncClient::new(opts, 32);
+    // The printer's TLS handshake is slow; rumqttc's 5 s default times out
+    // on roughly every other attempt.
+    events.network_options.set_connection_timeout(20);
     *live.client.lock().unwrap() = Some(client.clone());
-    let report_topic = format!("device/{}/report", cfg.serial);
-    let request_topic = format!("device/{}/request", cfg.serial);
-
+    let mut serial = cfg.serial.clone();
+    let mut report_topic = format!("device/{serial}/report");
+    let mut request_topic = format!("device/{serial}/request");
     let mut backoff = Duration::from_secs(1);
     let mut pushall_timer = tokio::time::interval(PUSHALL_EVERY);
     pushall_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -103,6 +120,18 @@ async fn run(id: String, cfg: PrinterConfig, live: Arc<Live>) {
             ev = events.poll() => match ev {
                 Ok(Event::Incoming(Packet::ConnAck(_))) => {
                     tracing::info!(printer = %id, host = %cfg.host, "MQTT connected");
+                    let cn = cert_cn.lock().unwrap().clone();
+                    if let Some(cn) = cn.filter(|cn| !cn.is_empty() && *cn != serial) {
+                        tracing::warn!(
+                            printer = %id,
+                            "configured serial {} does not match the printer's certificate ({cn}); using {cn}",
+                            cfg.serial
+                        );
+                        serial = cn.clone();
+                        report_topic = format!("device/{serial}/report");
+                        request_topic = format!("device/{serial}/request");
+                        *live.detected_serial.lock().unwrap() = Some(cn);
+                    }
                     backoff = Duration::from_secs(1);
                     if let Err(e) = client.try_subscribe(&report_topic, QoS::AtMostOnce) {
                         tracing::warn!(printer = %id, "subscribe failed: {e}");
@@ -114,6 +143,7 @@ async fn run(id: String, cfg: PrinterConfig, live: Arc<Live>) {
                         serde_json::to_vec(&pushall(live.next_seq())).unwrap(),
                     );
                     live.connected.store(true, Ordering::Release);
+                    *live.last_error.lock().unwrap() = None;
                 }
                 Ok(Event::Incoming(Packet::Publish(p))) => {
                     match serde_json::from_slice::<Value>(&p.payload) {
@@ -132,11 +162,17 @@ async fn run(id: String, cfg: PrinterConfig, live: Arc<Live>) {
                 }
                 Ok(_) => {}
                 Err(e) => {
+                    let msg = format!("MQTT connection to {}:{MQTT_PORT} failed: {e}", cfg.host);
                     if live.connected.swap(false, Ordering::AcqRel) {
                         tracing::warn!(printer = %id, "MQTT disconnected: {e}");
                     } else {
-                        tracing::debug!(printer = %id, "MQTT connect failed: {e}");
+                        // Warn once per distinct error, not every backoff tick.
+                        let prev = live.last_error.lock().unwrap().clone();
+                        if prev.as_deref() != Some(msg.as_str()) {
+                            tracing::warn!(printer = %id, "{msg}");
+                        }
                     }
+                    *live.last_error.lock().unwrap() = Some(msg);
                     tokio::time::sleep(backoff).await;
                     backoff = (backoff * 2).min(MAX_BACKOFF);
                 }

@@ -62,7 +62,9 @@ async fn snapshot_from(host: &str, port: u16, access_code: &str) -> Result<Vec<u
         Ok(Err(e)) => return Err(SnapshotError::Other(e.into())),
         Ok(Ok(s)) => s,
     };
-    tokio::time::timeout(Duration::from_secs(10), read_frame(tcp, host, access_code))
+    // The printer's TLS handshake alone takes ~5 s (longer while MQTT is
+    // busy), so leave generous headroom for handshake + first frame.
+    tokio::time::timeout(Duration::from_secs(30), read_frame(tcp, host, access_code))
         .await
         .map_err(|_| SnapshotError::Other(anyhow::anyhow!("camera frame timed out")))?
         .map_err(SnapshotError::Other)
@@ -73,10 +75,13 @@ async fn read_frame(tcp: TcpStream, host: &str, access_code: &str) -> anyhow::Re
         .connect(tls::server_name(host)?, tcp)
         .await
         .context("camera TLS handshake")?;
+    tracing::debug!(host, "camera TLS up");
     s.write_all(&auth_packet("bblp", access_code)).await?;
     s.flush().await?;
+    tracing::debug!(host, "camera auth sent");
     let mut header = [0u8; 16];
     s.read_exact(&mut header).await.context("camera header")?;
+    tracing::debug!(host, header = ?header, "camera header");
     let size = u32::from_le_bytes(header[0..4].try_into().unwrap()) as usize;
     if size == 0 || size > MAX_FRAME {
         bail!("implausible camera frame size {size} (wrong access code?)");

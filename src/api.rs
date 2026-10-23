@@ -217,7 +217,10 @@ async fn status_route(State(st): State<Shared>, Path(id): Path<String>) -> Respo
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let connected = p.live.connected.load(Ordering::Acquire);
-    let s = status::normalise(&p.live.state.lock().unwrap(), connected, now);
+    let mut s = status::normalise(&p.live.state.lock().unwrap(), connected, now);
+    if !connected && s.message.is_none() {
+        s.message = p.live.last_error.lock().unwrap().clone();
+    }
     Json(s).into_response()
 }
 
