@@ -1,0 +1,76 @@
+name: Release
+
+# Builds static x86_64 + aarch64 Linux (musl) binaries and attaches them to
+# the GitHub release for the pushed tag (`v*`). Re-running a tag re-uploads
+# with --clobber.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to (re)build
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [x86_64-unknown-linux-musl, aarch64-unknown-linux-musl]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Test
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: cargo test
+
+      - name: Build
+        run: |
+          cross build --release --target ${{ matrix.target }}
+          arch="${{ matrix.target }}"; arch="${arch%%-*}"
+          cp "target/${{ matrix.target }}/release/print-bridge" "print-bridge-linux-${arch}"
+          sha256sum "print-bridge-linux-${arch}" > "print-bridge-linux-${arch}.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: print-bridge-linux-*
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          ls -la dist
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+            gh release edit "$TAG" --draft=false --latest
+          else
+            gh release create "$TAG" dist/* --title "$TAG" \
+              --notes "print-bridge $TAG — static Linux binaries (x86_64, aarch64). See README for install." --latest
+          fi

@@ -1,0 +1,36 @@
+[package]
+name = "print-bridge"
+version = "0.1.0"
+edition = "2024"
+description = "Local HTTP bridge for Bambu Lab printers in LAN mode (MQTT/FTPS/camera)."
+license = "MIT"
+publish = false
+
+# Standalone project: keep the parent peckboard checkout from treating this
+# as a member of (or an error against) its own workspace.
+[workspace]
+
+[dependencies]
+anyhow = "1"
+axum = "0.8"
+clap = { version = "4", features = ["derive", "env"] }
+rumqttc = { version = "0.25", default-features = false, features = ["use-rustls-no-provider"] }
+# ring (not aws-lc-rs): pure Rust + a little C/asm that cross-compiles to musl
+# without cmake/clang.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "signal", "fs"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+http-body-util = "0.1"
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+tower = { version = "0.5", features = ["util"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

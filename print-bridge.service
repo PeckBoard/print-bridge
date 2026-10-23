@@ -1,0 +1,25 @@
+# systemd user unit for print-bridge.
+#
+#   install -Dm755 print-bridge ~/.local/bin/print-bridge
+#   install -Dm644 print-bridge.service ~/.config/systemd/user/print-bridge.service
+#   mkdir -p ~/.config/print-bridge
+#   head -c 32 /dev/urandom | base64 > ~/.config/print-bridge/token
+#   chmod 600 ~/.config/print-bridge/token
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now print-bridge
+#   loginctl enable-linger "$USER"   # keep it running while logged out
+[Unit]
+Description=print-bridge: local HTTP bridge for Bambu Lab printers
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+ExecStart=%h/.local/bin/print-bridge --bind 127.0.0.1:7781 --token-file %h/.config/print-bridge/token
+Environment=RUST_LOG=print_bridge=info
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=default.target
