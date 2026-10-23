@@ -1,19 +1,174 @@
-//! Single-frame snapshot from the P1/A1 camera service: TLS on port 6000,
-//! an 80-byte auth packet, then a stream of `[16-byte header][JPEG]` frames
+//! Camera frames from the P1/A1 camera service: TLS on port 6000, an
+//! 80-byte auth packet, then a stream of `[16-byte header][JPEG]` frames
 //! (all integers little-endian). X1/H2/P2S use RTSPS on 322 instead, which
 //! needs an RTSP + H.264 decoder; the bridge does not support those.
+//!
+//! The printer's TLS handshake takes 3–30 s (worse on weak Wi-Fi), so a
+//! fresh connection per snapshot often timed out. [`Camera`] keeps one stream
+//! open while snapshots are being asked for and serves the latest frame from
+//! memory; it hangs up after [`IDLE`] without requests, because the printer
+//! allows a single camera client (Bambu Handy / Studio need it back).
 
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::sync::watch;
 use tokio_rustls::TlsConnector;
+use tokio_rustls::client::TlsStream;
 
 use crate::tls;
 
 pub const CAMERA_PORT: u16 = 6000;
 const MAX_FRAME: usize = 8 * 1024 * 1024;
+/// Hang up after this long without a snapshot request.
+pub const IDLE: Duration = Duration::from_secs(60);
+/// Reconnect when the stream delivers no bytes at all for this long. Not a
+/// per-frame limit: TLS hands over whole records (up to 16 KiB) and a lossy
+/// printer Wi-Fi link was measured at ~1 KB/s, so one frame can take minutes.
+const STALL_TIMEOUT: Duration = Duration::from_secs(45);
+const STALLED: &str = "camera connected but sent no data (LAN Only Liveview off on the printer, or its Wi-Fi is too weak)";
+const RETRY_DELAY: Duration = Duration::from_secs(3);
+
+#[derive(Clone)]
+pub struct Frame {
+    pub jpeg: Arc<Vec<u8>>,
+    pub at: Instant,
+}
+
+#[derive(Default)]
+struct Meta {
+    running: bool,
+    unsupported: bool,
+    last_request: Option<Instant>,
+    last_error: Option<String>,
+}
+
+/// One printer's camera: a lazily started, self-stopping frame stream.
+pub struct Camera {
+    host: String,
+    port: u16,
+    access_code: String,
+    meta: Mutex<Meta>,
+    frames: watch::Sender<Option<Frame>>,
+    stopped: AtomicBool,
+}
+
+impl Camera {
+    pub fn new(host: &str, access_code: &str) -> Arc<Self> {
+        Self::with_port(host, CAMERA_PORT, access_code)
+    }
+
+    fn with_port(host: &str, port: u16, access_code: &str) -> Arc<Self> {
+        Arc::new(Self {
+            host: host.to_owned(),
+            port,
+            access_code: access_code.to_owned(),
+            meta: Mutex::new(Meta::default()),
+            frames: watch::channel(None).0,
+            stopped: AtomicBool::new(false),
+        })
+    }
+
+    /// Stop streaming now (the printer was removed or reconfigured).
+    pub fn stop(&self) {
+        self.stopped.store(true, Ordering::Release);
+    }
+
+    /// A frame no older than `max_age`, waiting up to `wait` for the stream to
+    /// deliver one. Falls back to an older frame rather than nothing.
+    pub async fn frame(
+        self: &Arc<Self>,
+        max_age: Duration,
+        wait: Duration,
+    ) -> Result<Frame, SnapshotError> {
+        {
+            let mut m = self.meta.lock().unwrap();
+            if m.unsupported {
+                return Err(SnapshotError::Unsupported);
+            }
+            m.last_request = Some(Instant::now());
+            if !m.running {
+                m.running = true;
+                tokio::spawn(self.clone().run());
+            }
+        }
+        let mut rx = self.frames.subscribe();
+        let fresh = |f: &Option<Frame>| f.as_ref().is_some_and(|f| f.at.elapsed() <= max_age);
+        let got = tokio::time::timeout(wait, rx.wait_for(fresh)).await;
+        if let Ok(Ok(f)) = got {
+            return Ok(f.clone().expect("wait_for matched a frame"));
+        }
+        if let Some(f) = self.frames.borrow().clone() {
+            return Ok(f);
+        }
+        let m = self.meta.lock().unwrap();
+        if m.unsupported {
+            return Err(SnapshotError::Unsupported);
+        }
+        Err(SnapshotError::Other(anyhow::anyhow!(
+            "{}",
+            m.last_error
+                .clone()
+                .unwrap_or_else(|| "camera is connecting; on weak printer Wi-Fi the first frame can take a minute or two".into())
+        )))
+    }
+
+    /// Whether to keep streaming; clears `running` under the lock when not,
+    /// so a concurrent `frame()` starts a new stream instead of waiting.
+    fn keep_going(&self) -> bool {
+        let mut m = self.meta.lock().unwrap();
+        let idle = m.last_request.is_none_or(|t| t.elapsed() > IDLE);
+        if idle || m.unsupported || self.stopped.load(Ordering::Acquire) {
+            m.running = false;
+            return false;
+        }
+        true
+    }
+
+    fn set_error(&self, e: impl std::fmt::Display) {
+        self.meta.lock().unwrap().last_error = Some(e.to_string());
+    }
+
+    async fn run(self: Arc<Self>) {
+        while self.keep_going() {
+            let mut s = match open(&self.host, self.port, &self.access_code).await {
+                Ok(s) => s,
+                Err(SnapshotError::Unsupported) => {
+                    self.meta.lock().unwrap().unsupported = true;
+                    continue;
+                }
+                Err(SnapshotError::Other(e)) => {
+                    tracing::warn!(host = %self.host, "camera connect failed: {e:#}");
+                    self.set_error(format!("{e:#}"));
+                    tokio::time::sleep(RETRY_DELAY).await;
+                    continue;
+                }
+            };
+            tracing::info!(host = %self.host, "camera stream up");
+            while self.keep_going() {
+                match read_frame(&mut s).await {
+                    Ok(jpeg) => {
+                        self.meta.lock().unwrap().last_error = None;
+                        self.frames.send_replace(Some(Frame {
+                            jpeg: Arc::new(jpeg),
+                            at: Instant::now(),
+                        }));
+                    }
+                    Err(e) => {
+                        tracing::warn!(host = %self.host, "camera stream broke: {e:#}");
+                        self.set_error(format!("{e:#}"));
+                        break;
+                    }
+                }
+            }
+        }
+        tracing::info!(host = %self.host, "camera stream closed");
+    }
+}
 
 /// Encode the auth packet: payload size 0x40, type 0x3000, flags 0, 0,
 /// then username and access code as NUL-padded 32-byte ASCII fields.
@@ -43,12 +198,13 @@ pub enum SnapshotError {
     Other(anyhow::Error),
 }
 
-pub async fn snapshot(host: &str, access_code: &str) -> Result<Vec<u8>, SnapshotError> {
-    snapshot_from(host, CAMERA_PORT, access_code).await
-}
-
-async fn snapshot_from(host: &str, port: u16, access_code: &str) -> Result<Vec<u8>, SnapshotError> {
-    let tcp = match tokio::time::timeout(Duration::from_secs(5), TcpStream::connect((host, port)))
+/// Connect, handshake and authenticate.
+async fn open(
+    host: &str,
+    port: u16,
+    access_code: &str,
+) -> Result<TlsStream<TcpStream>, SnapshotError> {
+    let tcp = match tokio::time::timeout(Duration::from_secs(10), TcpStream::connect((host, port)))
         .await
     {
         Err(_) => {
@@ -62,38 +218,51 @@ async fn snapshot_from(host: &str, port: u16, access_code: &str) -> Result<Vec<u
         Ok(Err(e)) => return Err(SnapshotError::Other(e.into())),
         Ok(Ok(s)) => s,
     };
-    // The printer's TLS handshake alone takes ~5 s (longer while MQTT is
-    // busy), so leave generous headroom for handshake + first frame.
-    tokio::time::timeout(Duration::from_secs(30), read_frame(tcp, host, access_code))
+    let handshake = async {
+        let mut s = TlsConnector::from(tls::client_config())
+            .connect(tls::server_name(host)?, tcp)
+            .await
+            .context("camera TLS handshake")?;
+        s.write_all(&auth_packet("bblp", access_code)).await?;
+        s.flush().await?;
+        anyhow::Ok(s)
+    };
+    tokio::time::timeout(Duration::from_secs(40), handshake)
         .await
-        .map_err(|_| SnapshotError::Other(anyhow::anyhow!("camera frame timed out")))?
+        .map_err(|_| SnapshotError::Other(anyhow::anyhow!("camera TLS handshake timed out")))?
         .map_err(SnapshotError::Other)
 }
+/// Fill `buf`, failing only when no bytes arrive for [`STALL_TIMEOUT`] — a
+/// frame over weak printer Wi-Fi can take minutes, but it keeps moving.
+async fn read_full(s: &mut TlsStream<TcpStream>, buf: &mut [u8], what: &str) -> anyhow::Result<()> {
+    let mut got = 0;
+    while got < buf.len() {
+        let n = tokio::time::timeout(STALL_TIMEOUT, s.read(&mut buf[got..]))
+            .await
+            .map_err(|_| anyhow::anyhow!("{STALLED}"))?
+            .with_context(|| what.to_owned())?;
+        if n == 0 {
+            bail!("{what}: the printer closed the stream");
+        }
+        got += n;
+    }
+    Ok(())
+}
 
-async fn read_frame(tcp: TcpStream, host: &str, access_code: &str) -> anyhow::Result<Vec<u8>> {
-    let mut s = TlsConnector::from(tls::client_config())
-        .connect(tls::server_name(host)?, tcp)
-        .await
-        .context("camera TLS handshake")?;
-    tracing::debug!(host, "camera TLS up");
-    s.write_all(&auth_packet("bblp", access_code)).await?;
-    s.flush().await?;
-    tracing::debug!(host, "camera auth sent");
+async fn read_frame(s: &mut TlsStream<TcpStream>) -> anyhow::Result<Vec<u8>> {
     let mut header = [0u8; 16];
-    s.read_exact(&mut header).await.context("camera header")?;
-    tracing::debug!(host, header = ?header, "camera header");
+    read_full(s, &mut header, "camera header").await?;
     let size = u32::from_le_bytes(header[0..4].try_into().unwrap()) as usize;
     if size == 0 || size > MAX_FRAME {
         bail!("implausible camera frame size {size} (wrong access code?)");
     }
     let mut jpeg = vec![0u8; size];
-    s.read_exact(&mut jpeg).await.context("camera frame")?;
+    read_full(s, &mut jpeg, "camera frame").await?;
     if !jpeg.starts_with(&[0xFF, 0xD8]) || !jpeg.ends_with(&[0xFF, 0xD9]) {
         bail!("camera frame is not a JPEG");
     }
     Ok(jpeg)
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -155,8 +324,19 @@ mod tests {
             // Keep streaming until the client hangs up.
             let _ = s.read(&mut [0u8; 1]).await;
         });
-        let got = snapshot_from("127.0.0.1", port, "12345678").await.unwrap();
-        assert_eq!(got, jpeg);
+        let cam = Camera::with_port("127.0.0.1", port, "12345678");
+        let got = cam
+            .frame(Duration::from_secs(5), Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert_eq!(*got.jpeg, jpeg);
+        // Served from memory while the stream stays up.
+        let again = cam
+            .frame(Duration::from_secs(60), Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(*again.jpeg, jpeg);
+        cam.stop();
         server.abort();
     }
 
@@ -165,8 +345,10 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         drop(listener);
+        let cam = Camera::with_port("127.0.0.1", port, "x");
         assert!(matches!(
-            snapshot_from("127.0.0.1", port, "x").await,
+            cam.frame(Duration::from_secs(5), Duration::from_secs(5))
+                .await,
             Err(SnapshotError::Unsupported)
         ));
     }

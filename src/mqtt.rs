@@ -95,7 +95,11 @@ async fn run(id: String, cfg: PrinterConfig, live: Arc<Live>) {
     );
     let mut opts = MqttOptions::new(client_id, cfg.host.clone(), MQTT_PORT);
     opts.set_credentials("bblp", cfg.access_code.clone());
-    opts.set_keep_alive(Duration::from_secs(30));
+    // A ping is declared lost when its ack hasn't arrived by the next ping;
+    // on weak printer Wi-Fi a 30 s interval dropped the link every few
+    // minutes ("Last pingreq isn't acked"). The printer pushes reports every
+    // second while printing, so the session stays verified anyway.
+    opts.set_keep_alive(Duration::from_secs(60));
     // A full pushall report with AMS data runs to tens of KB.
     opts.set_max_packet_size(4 * 1024 * 1024, 256 * 1024);
     let cert_cn: tls::CnSink = Default::default();

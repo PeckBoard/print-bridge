@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 
-use crate::camera::{self, SnapshotError};
+use crate::camera::{self, Camera, SnapshotError};
 use crate::ftps;
 use crate::mqtt::{self, CommandError, Live};
 use crate::status;
@@ -27,6 +27,7 @@ const MAX_UPLOAD: usize = 1024 * 1024 * 1024;
 pub struct Printer {
     pub cfg: PrinterConfig,
     pub live: Arc<Live>,
+    pub camera: Arc<Camera>,
     task: Option<JoinHandle<()>>,
 }
 
@@ -36,6 +37,7 @@ impl Printer {
         let live = Arc::new(Live::default());
         let task = mqtt::spawn(id.to_owned(), cfg.clone(), live.clone());
         Self {
+            camera: Camera::new(&cfg.host, &cfg.access_code),
             cfg,
             live,
             task: Some(task),
@@ -45,6 +47,7 @@ impl Printer {
     /// A printer with no connection (tests drive `live` by hand).
     pub fn detached(cfg: PrinterConfig, live: Arc<Live>) -> Self {
         Self {
+            camera: Camera::new(&cfg.host, &cfg.access_code),
             cfg,
             live,
             task: None,
@@ -57,6 +60,7 @@ impl Drop for Printer {
         if let Some(t) = self.task.take() {
             t.abort();
         }
+        self.camera.stop();
         self.live.connected.store(false, Ordering::Release);
     }
 }
@@ -397,7 +401,17 @@ async fn stop(State(st): State<Shared>, Path(id): Path<String>) -> Response {
     simple_command(&st, &id, "stop").await
 }
 
-async fn snapshot(State(st): State<Shared>, Path(id): Path<String>) -> Response {
+#[derive(Deserialize)]
+struct SnapshotQuery {
+    /// Seconds to wait for a fresh frame while the stream connects.
+    wait: Option<u64>,
+}
+
+async fn snapshot(
+    State(st): State<Shared>,
+    Path(id): Path<String>,
+    Query(q): Query<SnapshotQuery>,
+) -> Response {
     let p = match get_printer(&st, &id).await {
         Ok(p) => p,
         Err(r) => return r,
@@ -408,13 +422,19 @@ async fn snapshot(State(st): State<Shared>, Path(id): Path<String>) -> Response 
             "snapshot unsupported: this model streams RTSPS on port 322",
         );
     }
-    match camera::snapshot(&p.cfg.host, &p.cfg.access_code).await {
-        Ok(jpeg) => (
+    // Default stays under callers' usual 15 s HTTP timeout.
+    let wait = Duration::from_secs(q.wait.unwrap_or(12).min(120));
+    match p.camera.frame(Duration::from_secs(5), wait).await {
+        Ok(f) => (
             [
-                (header::CONTENT_TYPE, "image/jpeg"),
-                (header::CACHE_CONTROL, "no-store"),
+                (header::CONTENT_TYPE, "image/jpeg".to_owned()),
+                (header::CACHE_CONTROL, "no-store".to_owned()),
+                (
+                    header::HeaderName::from_static("x-frame-age-ms"),
+                    f.at.elapsed().as_millis().to_string(),
+                ),
             ],
-            jpeg,
+            f.jpeg.as_ref().clone(),
         )
             .into_response(),
         Err(SnapshotError::Unsupported) => err(
