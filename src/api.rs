@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
@@ -183,6 +183,12 @@ async fn upsert(
         );
     }
     let mut printers = st.printers.write().await;
+    // Re-registering the same config must not drop a live connection: the
+    // printer's TLS handshake takes 5-40 s, so a reconnect on every save or
+    // connection test reads as "offline".
+    if printers.get(&id).is_some_and(|p| p.cfg == cfg) {
+        return Json(json!({"ok": true, "changed": false})).into_response();
+    }
     // Replacing drops the old Printer, which aborts its MQTT task.
     let printer = if st.connect {
         Printer::connect(&id, cfg)
@@ -207,11 +213,30 @@ async fn remove(State(st): State<Shared>, Path(id): Path<String>) -> Response {
     Json(json!({"ok": true})).into_response()
 }
 
-async fn status_route(State(st): State<Shared>, Path(id): Path<String>) -> Response {
+#[derive(Deserialize)]
+struct StatusQuery {
+    /// Long-poll: wait up to this many seconds (max 60) for the printer to
+    /// connect and send its first report before answering.
+    wait: Option<u64>,
+}
+
+async fn status_route(
+    State(st): State<Shared>,
+    Path(id): Path<String>,
+    Query(q): Query<StatusQuery>,
+) -> Response {
     let p = match get_printer(&st, &id).await {
         Ok(p) => p,
         Err(r) => return r,
     };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(q.wait.unwrap_or(0).min(60));
+    // Connected alone is not enough: the first pushall report follows the
+    // ConnAck by a second or two, and until then the state is empty.
+    while !(p.live.connected.load(Ordering::Acquire) && !p.live.state.lock().unwrap().is_null())
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -448,6 +473,39 @@ mod tests {
         (code, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
     }
 
+    async fn put_json(app: &Router, uri: &str, body: Value) -> (StatusCode, Value) {
+        let req = Request::builder()
+            .method("PUT")
+            .uri(uri)
+            .header(header::AUTHORIZATION, "Bearer tok")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        let code = res.status();
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        (code, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    }
+
+    #[tokio::test]
+    async fn re_registering_same_config_keeps_the_connection() {
+        let (app, live) = app_with_fake();
+        live.connected.store(true, Ordering::Release);
+        let same = json!({"host": "192.0.2.10", "serial": "01P00A000000000",
+            "access_code": "secret99", "model": "P1S"});
+        let (code, body) = put_json(&app, "/printers/p1s", same).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["changed"], false);
+        assert!(live.connected.load(Ordering::Acquire), "connection dropped");
+
+        let changed = json!({"host": "192.0.2.11", "serial": "01P00A000000000",
+            "access_code": "secret99", "model": "P1S"});
+        put_json(&app, "/printers/p1s", changed).await;
+        assert!(
+            !live.connected.load(Ordering::Acquire),
+            "old connection kept"
+        );
+    }
     #[tokio::test]
     async fn auth_is_required_everywhere() {
         let (app, _) = app_with_fake();
