@@ -96,19 +96,21 @@ pub fn parse_pasv_port(text: &str) -> anyhow::Result<u16> {
     }
     Ok(nums[4] * 256 + nums[5])
 }
-
 /// Upload `data` as `/{name}` on the printer.
 pub async fn upload(host: &str, access_code: &str, name: &str, data: &[u8]) -> anyhow::Result<()> {
     upload_to(host, FTPS_PORT, access_code, name, data).await
 }
 
-async fn upload_to(
-    host: &str,
-    port: u16,
-    access_code: &str,
-    name: &str,
-    data: &[u8],
-) -> anyhow::Result<()> {
+/// A logged-in control connection plus what the data channel needs to
+/// resume its TLS session.
+struct Session {
+    ctl: Control<tokio_rustls::client::TlsStream<TcpStream>>,
+    connector: TlsConnector,
+    server: rustls::pki_types::ServerName<'static>,
+    host: String,
+}
+
+async fn login(host: &str, port: u16, access_code: &str) -> anyhow::Result<Session> {
     let config = tls::client_config();
     let connector = TlsConnector::from(config);
     let server = tls::server_name(host)?;
@@ -133,19 +135,81 @@ async fn upload_to(
     ctl.cmd("PBSZ 0", &[200]).await?;
     ctl.cmd("PROT P", &[200]).await?;
     ctl.cmd("TYPE I", &[200]).await?;
-    let pasv = ctl.cmd("PASV", &[227]).await?;
-    let port = parse_pasv_port(&pasv)?;
+    Ok(Session {
+        ctl,
+        connector,
+        server,
+        host: host.to_owned(),
+    })
+}
 
-    let data_tcp = tokio::time::timeout(IO_TIMEOUT, TcpStream::connect((host, port)))
-        .await
-        .context("FTPS data connect timed out")??;
-    ctl.cmd(&format!("STOR {name}"), &[125, 150]).await?;
-    let mut data_tls = connector
-        .connect(server, data_tcp)
-        .await
-        .context("FTPS data TLS handshake (session reuse)")?;
-    let resumed = data_tls.get_ref().1.handshake_kind();
-    tracing::debug!(?resumed, "FTPS data channel handshake");
+impl Session {
+    /// PASV, TCP-connect the data port, send `line`, then do the data TLS
+    /// handshake (resuming the control session).
+    async fn open_data(
+        &mut self,
+        line: &str,
+    ) -> anyhow::Result<tokio_rustls::client::TlsStream<TcpStream>> {
+        let pasv = self.ctl.cmd("PASV", &[227]).await?;
+        let port = parse_pasv_port(&pasv)?;
+        let data_tcp =
+            tokio::time::timeout(IO_TIMEOUT, TcpStream::connect((self.host.as_str(), port)))
+                .await
+                .context("FTPS data connect timed out")??;
+        self.ctl.cmd(line, &[125, 150]).await?;
+        let data_tls = self
+            .connector
+            .connect(self.server.clone(), data_tcp)
+            .await
+            .context("FTPS data TLS handshake (session reuse)")?;
+        let resumed = data_tls.get_ref().1.handshake_kind();
+        tracing::debug!(?resumed, "FTPS data channel handshake");
+        Ok(data_tls)
+    }
+
+    async fn transfer_done(&mut self) -> anyhow::Result<()> {
+        let (code, text) = self.ctl.reply().await?;
+        if code != 226 && code != 250 {
+            bail!("FTP transfer failed: {text}");
+        }
+        Ok(())
+    }
+
+    /// `LIST dir`; returns the raw listing.
+    async fn list(&mut self, dir: &str) -> anyhow::Result<String> {
+        let mut data = self.open_data(&format!("LIST {dir}")).await?;
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 8192];
+        // vsftpd may close the data socket without a TLS close_notify; keep
+        // whatever arrived before the (unexpected) EOF.
+        let _ = tokio::time::timeout(IO_TIMEOUT, async {
+            while let Ok(n) = data.read(&mut chunk).await {
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+        })
+        .await;
+        drop(data);
+        self.transfer_done().await?;
+        Ok(String::from_utf8_lossy(&buf).into_owned())
+    }
+
+    async fn quit(mut self) {
+        let _ = self.ctl.cmd("QUIT", &[221]).await;
+    }
+}
+
+async fn upload_to(
+    host: &str,
+    port: u16,
+    access_code: &str,
+    name: &str,
+    data: &[u8],
+) -> anyhow::Result<()> {
+    let mut s = login(host, port, access_code).await?;
+    let mut data_tls = s.open_data(&format!("STOR {name}")).await?;
 
     data_tls.write_all(data).await.context("FTPS data write")?;
     data_tls.shutdown().await.context("FTPS data close")?;
@@ -160,12 +224,157 @@ async fn upload_to(
     .await;
     drop(data_tls);
 
-    let (code, text) = ctl.reply().await?;
-    if code != 226 && code != 250 {
-        bail!("FTP transfer failed: {text}");
-    }
-    let _ = ctl.cmd("QUIT", &[221]).await;
+    s.transfer_done().await?;
+    s.quit().await;
     Ok(())
+}
+
+/// One file on the printer's storage.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct RemoteFile {
+    /// Path relative to the storage root (`benchy.3mf`, `cache/x.3mf`).
+    pub name: String,
+    pub size: u64,
+    /// Unix seconds; `null` when the listing's date can't be parsed.
+    pub mtime: Option<u64>,
+}
+
+/// Directories listed by [`list_files`], with the prefix their entries get.
+const LIST_DIRS: [(&str, &str); 2] = [("/", ""), ("/cache", "cache/")];
+
+/// List the files in `/` and `/cache` (a missing `/cache` is skipped).
+pub async fn list_files(host: &str, access_code: &str) -> anyhow::Result<Vec<RemoteFile>> {
+    list_files_at(host, FTPS_PORT, access_code, now_unix()).await
+}
+
+async fn list_files_at(
+    host: &str,
+    port: u16,
+    access_code: &str,
+    now: u64,
+) -> anyhow::Result<Vec<RemoteFile>> {
+    let mut s = login(host, port, access_code).await?;
+    let mut out = Vec::new();
+    for (i, (dir, prefix)) in LIST_DIRS.iter().enumerate() {
+        match s.list(dir).await {
+            Ok(text) => out.extend(parse_list(&text, prefix, now)),
+            // The root must list; the cache dir may not exist.
+            Err(e) if i == 0 => return Err(e),
+            Err(e) => tracing::debug!("LIST {dir} failed: {e:#}"),
+        }
+    }
+    s.quit().await;
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(out)
+}
+
+/// Delete `name` (a path from [`list_files`]) on the printer.
+pub async fn delete_file(host: &str, access_code: &str, name: &str) -> anyhow::Result<()> {
+    delete_file_at(host, FTPS_PORT, access_code, name).await
+}
+
+async fn delete_file_at(
+    host: &str,
+    port: u16,
+    access_code: &str,
+    name: &str,
+) -> anyhow::Result<()> {
+    let mut s = login(host, port, access_code).await?;
+    s.ctl.cmd(&format!("DELE /{name}"), &[250]).await?;
+    s.quit().await;
+    Ok(())
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+const MONTHS: [&str; 12] = [
+    "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+];
+
+/// Days since 1970-01-01 for a proleptic Gregorian date.
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (m as i64 + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+fn year_of(unix: u64) -> i64 {
+    // Good enough to pick the listing's implied year.
+    let days = (unix / 86_400) as i64;
+    let mut y = 1970 + days / 365;
+    while days_from_civil(y, 1, 1) > days {
+        y -= 1;
+    }
+    while days_from_civil(y + 1, 1, 1) <= days {
+        y += 1;
+    }
+    y
+}
+
+/// `ls -l` date: `Oct 22 10:00` (this year, or last year when that would be
+/// in the future) or `Oct 22  2023`.
+fn parse_ls_date(mon: &str, day: &str, time_or_year: &str, now: u64) -> Option<u64> {
+    let m = MONTHS.iter().position(|x| x.eq_ignore_ascii_case(mon))? as u32 + 1;
+    let d: u32 = day.parse().ok().filter(|d| (1..=31).contains(d))?;
+    let (year, secs) = if let Some((h, min)) = time_or_year.split_once(':') {
+        let (h, min): (u64, u64) = (h.parse().ok()?, min.parse().ok()?);
+        let secs = h * 3600 + min * 60;
+        let this = year_of(now);
+        let t = days_from_civil(this, m, d) * 86_400 + secs as i64;
+        // More than a day ahead means the entry is from last year.
+        if t > now as i64 + 86_400 {
+            (this - 1, secs)
+        } else {
+            (this, secs)
+        }
+    } else {
+        (time_or_year.parse().ok()?, 0)
+    };
+    let t = days_from_civil(year, m, d) * 86_400 + secs as i64;
+    u64::try_from(t).ok()
+}
+
+/// Parse a unix `LIST` reply. Regular files only; `prefix` is prepended to
+/// each name.
+pub fn parse_list(text: &str, prefix: &str, now: u64) -> Vec<RemoteFile> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = line.trim_end_matches('\r');
+        if !line.starts_with('-') {
+            continue; // directories, links, "total N"
+        }
+        // perms links owner group size mon day time|year name...
+        let mut rest = line;
+        let mut fields = Vec::with_capacity(8);
+        for _ in 0..8 {
+            rest = rest.trim_start();
+            let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+            fields.push(&rest[..end]);
+            rest = &rest[end..];
+        }
+        let name = rest.strip_prefix(' ').unwrap_or(rest).trim_start();
+        let Ok(size) = fields[4].parse::<u64>() else {
+            continue;
+        };
+        if name.is_empty() || name == "." || name == ".." {
+            continue;
+        }
+        out.push(RemoteFile {
+            name: format!("{prefix}{name}"),
+            size,
+            mtime: parse_ls_date(fields[5], fields[6], fields[7], now),
+        });
+    }
+    out
 }
 
 #[cfg(test)]
@@ -274,6 +483,7 @@ mod tests {
         }
         say(&mut ctl, "220-print-bridge test\r\n220 ready").await?;
         let mut data_listener = None;
+        let mut deleted = String::new();
         loop {
             let mut line = String::new();
             if ctl.read_line(&mut line).await? == 0 {
@@ -324,6 +534,28 @@ mod tests {
                     let _ = say(&mut ctl, "221 Goodbye.").await;
                     return Ok((arg.to_owned(), buf));
                 }
+                "LIST" if arg == "/cache" => say(&mut ctl, "550 Failed to open directory.").await?,
+                "LIST" => {
+                    let (tcp, _) = data_listener.take().unwrap().accept().await?;
+                    say(&mut ctl, "150 Here comes the directory listing.").await?;
+                    let mut data = acceptor.accept(tcp).await?;
+                    data.write_all(
+                        b"drwxr-xr-x    2 root root     4096 Jan 01  2024 timelapse\r\n\
+                          -rw-r--r--    1 root root  1234567 Mar 05  2024 my benchy.3mf\r\n",
+                    )
+                    .await?;
+                    let _ = data.shutdown().await;
+                    drop(data);
+                    say(&mut ctl, "226 Directory send OK.").await?;
+                }
+                "DELE" => {
+                    deleted = arg.to_owned();
+                    say(&mut ctl, "250 Delete operation successful.").await?;
+                }
+                "QUIT" => {
+                    let _ = say(&mut ctl, "221 Goodbye.").await;
+                    return Ok((deleted, Vec::new()));
+                }
                 _ => say(&mut ctl, "500 Unknown command.").await?,
             }
         }
@@ -367,5 +599,65 @@ mod tests {
         assert!(e.to_string().contains("PASS ****"), "{e}");
         assert!(!e.to_string().contains("wrong"));
         server.abort();
+    }
+
+    #[test]
+    fn parses_unix_listing() {
+        let now = (days_from_civil(2026, 10, 23) * 86_400) as u64;
+        let text = "total 8\r\n\
+            drwxr-xr-x    2 root     root         4096 Jan 01  2024 cache\r\n\
+            -rw-r--r--    1 root     root      1234567 Oct 22 10:00 benchy.gcode.3mf\r\n\
+            -rw-r--r--    1 root     root           42 Dec 25 08:30 old one.gcode\r\n\
+            -rw-r--r--    1 root     root            7 Mar 05  2024 x.3mf\r\n\
+            lrwxrwxrwx    1 root     root            4 Mar 05  2024 link -> x\r\n";
+        let files = parse_list(text, "cache/", now);
+        assert_eq!(files.len(), 3);
+        assert_eq!(files[0].name, "cache/benchy.gcode.3mf");
+        assert_eq!(files[0].size, 1_234_567);
+        assert_eq!(
+            files[0].mtime,
+            Some((days_from_civil(2026, 10, 22) * 86_400 + 36_000) as u64)
+        );
+        assert_eq!(files[1].name, "cache/old one.gcode", "spaces kept");
+        assert_eq!(
+            files[1].mtime,
+            Some((days_from_civil(2025, 12, 25) * 86_400 + 30_600) as u64),
+            "future date means last year"
+        );
+        assert_eq!(
+            files[2].mtime,
+            Some((days_from_civil(2024, 3, 5) * 86_400) as u64)
+        );
+        assert_eq!(days_from_civil(1970, 1, 1), 0);
+        assert_eq!(year_of(now), 2026);
+    }
+
+    #[tokio::test]
+    async fn lists_and_deletes_over_ftps() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(fake_vsftpd(
+            listener,
+            crate::tls::test_server_config(&[&rustls::version::TLS12]),
+        ));
+        let files = list_files_at("127.0.0.1", port, "12345678", now_unix())
+            .await
+            .unwrap();
+        assert_eq!(
+            files.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
+            ["my benchy.3mf"]
+        );
+        server.await.unwrap().unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(fake_vsftpd(
+            listener,
+            crate::tls::test_server_config(&[&rustls::version::TLS12]),
+        ));
+        delete_file_at("127.0.0.1", port, "12345678", "cache/a.3mf")
+            .await
+            .unwrap();
+        assert_eq!(server.await.unwrap().unwrap().0, "/cache/a.3mf");
     }
 }

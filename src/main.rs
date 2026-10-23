@@ -3,6 +3,7 @@
 
 mod api;
 mod camera;
+mod commands;
 mod ftps;
 mod mqtt;
 mod status;

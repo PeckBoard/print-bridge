@@ -64,9 +64,10 @@ on updated X1, P1, A1 and H2 firmware, third-party LAN clients can still
 in some cases FTPS uploads are rejected unless the printer is in
 **LAN Only Mode with Developer Mode enabled** (Settings → Network → LAN Only
 Mode → Developer Mode). Developer Mode disables cloud features and Bambu
-Handy for that printer. If commands return `{ok:true}` but nothing happens,
-check the bridge log for `printer rejected command` and enable Developer
-Mode. Older firmware is not affected.
+Handy for that printer. A refused command answers `409` with
+`needs_developer_mode: true` (the printer replies `mqtt message verify
+failed`, err_code `0x05024007`, HMS `0500_0500_0001_0007`). Older firmware
+is not affected.
 
 Other caveats:
 
@@ -100,17 +101,37 @@ Errors are `{"ok": false, "error": "..."}`.
 | `DELETE /printers/{id}`         |                                                                 | `{ok: true}`; disconnects                                                                  |
 | `GET /printers/{id}/status`     |                                                                 | normalised status (below)                                                                  |
 | `POST /printers/{id}/upload`    | `?name=<file>`, raw body (≤ 1 GiB)                              | `{ok: true}` once the FTPS transfer completes; `502` on FTP/TLS failure                    |
-| `POST /printers/{id}/start`     | `{file, plate?: 1, use_ams?: false, bed_leveling?: true, ams_mapping?: [int]}` | `{ok: true}`; `.3mf` → `project_file` (`Metadata/plate_{plate}.gcode`), `.gcode` → `gcode_file` |
-| `POST /printers/{id}/pause`     |                                                                 | `{ok: true}`                                                                               |
-| `POST /printers/{id}/resume`    |                                                                 | `{ok: true}`                                                                               |
-| `POST /printers/{id}/stop`      |                                                                 | `{ok: true}`                                                                               |
+| `POST /printers/{id}/start`     | `{file, plate?: 1, use_ams?: false, bed_leveling?: true, ams_mapping?: [int]}` | `{ok: true, confirmed}`; `.3mf` → `project_file` (`Metadata/plate_{plate}.gcode`), `.gcode` → `gcode_file` |
+| `POST /printers/{id}/pause`     |                                                                 | `{ok: true, confirmed}`                                                                    |
+| `POST /printers/{id}/resume`    |                                                                 | `{ok: true, confirmed}`                                                                    |
+| `POST /printers/{id}/stop`      |                                                                 | `{ok: true, confirmed}`                                                                    |
+| `POST /printers/{id}/command`   | `{type, ...}` (below)                                           | `{ok: true, confirmed}`                                                                    |
+| `GET /printers/{id}/files`      |                                                                 | `{files: [{name, size, mtime}]}` — FTPS `LIST` of `/` and `/cache` (`cache/<file>`)        |
+| `DELETE /printers/{id}/files`   | `?name=<file>` (a listed name; no `..`)                         | `{ok: true}`                                                                               |
 | `GET /printers/{id}/snapshot`   |                                                                 | `image/jpeg`; `404` if the model has no port-6000 camera                                   |
 
 Commands return `503` while the MQTT link is down (they are not queued, so a
 `stop` can never arrive minutes late) and `404` for an unknown printer.
-`{ok:true}` means the command was **sent**; the printer acknowledges
-asynchronously — watch `/status` for the effect.
+Every command waits up to 6 s for the printer's reply (matched on `command`
++ `sequence_id`): `confirmed: false` means it was sent but not answered in
+time. A refusal answers `409 {ok:false, error, reason, err_code,
+needs_developer_mode: true}` for the signature check (`0x05024007` /
+`0x05024009` / "mqtt message verify failed") and `502 {ok:false, error,
+reason, err_code}` otherwise.
 
+`/command` types: `speed {level: 1-4}`, `temp {heater: nozzle|bed, target}`
+(M104/M140, clamped to 300 / 110 °C), `fan {fan: part|aux|chamber,
+percent}` (M106 P1/P2/P3), `light {on}` (chamber light), `home` (G28),
+`jog {axis: x|y|z, distance}` (≤ 100 mm), `motors_off` (M18), `extrude {mm}`
+(≤ 100 mm, nozzle ≥ 170 °C), `load {slot: 0-15 | "external"}`, `unload`
+(`ams_change_filament`), `gcode {line}` (one line, ≤ 256 chars). Motion,
+extrusion, load/unload and G-code answer `409` while printing or paused.
+
+The status also carries `speed_level`, `fans` (%), `light`, `wifi_signal`,
+`firmware`, `developer_mode` (from the `fun` bitfield; `null` when not
+reported) and `errors: [{code, text, severity, url?}]` (HMS codes, then a
+
+nonzero `print_error`).
 ### Status Shape
 
 ```json

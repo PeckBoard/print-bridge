@@ -17,8 +17,9 @@ use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 
 use crate::camera::{self, Camera, SnapshotError};
+use crate::commands::{self, BuildError, Command};
 use crate::ftps;
-use crate::mqtt::{self, CommandError, Live};
+use crate::mqtt::{self, Ack, CommandError, Live};
 use crate::status;
 use crate::store::{PrinterConfig, Store};
 
@@ -89,6 +90,8 @@ pub fn router(state: Shared) -> Router {
         .route("/printers/{id}/pause", post(pause))
         .route("/printers/{id}/resume", post(resume))
         .route("/printers/{id}/stop", post(stop))
+        .route("/printers/{id}/command", post(command_route))
+        .route("/printers/{id}/files", get(files_list).delete(files_delete))
         .route("/printers/{id}/snapshot", get(snapshot))
         .layer(middleware::from_fn_with_state(state.clone(), auth))
         .with_state(state)
@@ -253,7 +256,38 @@ async fn status_route(
     if !connected && s.message.is_none() {
         s.message = p.live.last_error.lock().unwrap().clone();
     }
+    s.firmware = p.live.firmware.lock().unwrap().clone();
     Json(s).into_response()
+}
+
+async fn command_route(
+    State(st): State<Shared>,
+    Path(id): Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    let p = match get_printer(&st, &id).await {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    let cmd: Command = match serde_json::from_value(body) {
+        Ok(c) => c,
+        Err(e) => return err(StatusCode::BAD_REQUEST, format!("invalid command: {e}")),
+    };
+    let connected = p.live.connected.load(Ordering::Acquire);
+    if !connected {
+        return err(StatusCode::SERVICE_UNAVAILABLE, "printer offline");
+    }
+    let s = status::normalise(&p.live.state.lock().unwrap(), connected, 0);
+    let ctx = commands::Ctx {
+        state: s.state,
+        nozzle_actual: s.temps.nozzle.as_ref().map(|t| t.actual),
+        nozzle_target: s.temps.nozzle.as_ref().and_then(|t| t.target),
+    };
+    match commands::build(&cmd, p.live.next_seq(), &ctx) {
+        Ok(payload) => send(&p, &payload).await,
+        Err(BuildError::Invalid(m)) => err(StatusCode::BAD_REQUEST, m),
+        Err(BuildError::Conflict(m)) => err(StatusCode::CONFLICT, m),
+    }
 }
 
 fn valid_file_name(name: &str) -> bool {
@@ -262,6 +296,45 @@ fn valid_file_name(name: &str) -> bool {
         && !name.contains(['/', '\\', '\r', '\n', '\0'])
         && name != "."
         && name != ".."
+}
+
+/// A storage path from the files listing: a plain name, or `cache/<name>`.
+fn valid_storage_path(name: &str) -> bool {
+    valid_file_name(name.strip_prefix("cache/").unwrap_or(name))
+}
+
+async fn files_list(State(st): State<Shared>, Path(id): Path<String>) -> Response {
+    let p = match get_printer(&st, &id).await {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    match ftps::list_files(&p.cfg.host, &p.cfg.access_code).await {
+        Ok(files) => Json(json!({"files": files})).into_response(),
+        Err(e) => err(StatusCode::BAD_GATEWAY, format!("listing failed: {e:#}")),
+    }
+}
+
+#[derive(Deserialize)]
+struct NameQuery {
+    name: String,
+}
+
+async fn files_delete(
+    State(st): State<Shared>,
+    Path(id): Path<String>,
+    Query(q): Query<NameQuery>,
+) -> Response {
+    let p = match get_printer(&st, &id).await {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    if !valid_storage_path(&q.name) {
+        return err(StatusCode::BAD_REQUEST, "invalid file name");
+    }
+    match ftps::delete_file(&p.cfg.host, &p.cfg.access_code, &q.name).await {
+        Ok(()) => Json(json!({"ok": true})).into_response(),
+        Err(e) => err(StatusCode::BAD_GATEWAY, format!("delete failed: {e:#}")),
+    }
 }
 
 #[derive(Deserialize)]
@@ -346,12 +419,54 @@ pub fn start_payload(
     }
 }
 
-fn command_result(r: Result<(), CommandError>) -> Response {
+fn command_result(r: Result<Ack, CommandError>) -> Response {
     match r {
-        Ok(()) => Json(json!({"ok": true})).into_response(),
+        Ok(ack) => Json(json!({"ok": true, "confirmed": ack.confirmed})).into_response(),
         Err(CommandError::Offline) => err(StatusCode::SERVICE_UNAVAILABLE, "printer offline"),
         Err(CommandError::Other(e)) => err(StatusCode::BAD_GATEWAY, e),
+        Err(CommandError::Refused {
+            reason,
+            err_code,
+            needs_developer_mode,
+        }) => {
+            tracing::warn!(
+                ?reason,
+                ?err_code,
+                needs_developer_mode,
+                "printer refused command"
+            );
+            let (code, error) = if needs_developer_mode {
+                (
+                    StatusCode::CONFLICT,
+                    "printer refused the command: enable LAN Only Mode and Developer Mode on the printer"
+                        .to_owned(),
+                )
+            } else {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    format!(
+                        "printer refused the command: {}",
+                        reason.as_deref().unwrap_or("unknown reason")
+                    ),
+                )
+            };
+            let mut body = json!({"ok": false, "error": error, "reason": reason,
+                "err_code": err_code});
+            if needs_developer_mode {
+                body["needs_developer_mode"] = json!(true);
+            }
+            (code, Json(body)).into_response()
+        }
     }
+}
+
+/// Publish and wait for the printer's verdict.
+async fn send(p: &Printer, payload: &Value) -> Response {
+    command_result(
+        p.live
+            .command(&p.cfg.serial, payload, mqtt::REPLY_WAIT)
+            .await,
+    )
 }
 
 async fn start(
@@ -376,7 +491,7 @@ async fn start(
     ) else {
         return err(StatusCode::BAD_REQUEST, "file must end in .3mf or .gcode");
     };
-    command_result(p.live.publish(&p.cfg.serial, &payload))
+    send(&p, &payload).await
 }
 
 async fn simple_command(st: &AppState, id: &str, command: &str) -> Response {
@@ -386,7 +501,7 @@ async fn simple_command(st: &AppState, id: &str, command: &str) -> Response {
     };
     let payload =
         json!({"print": {"sequence_id": p.live.next_seq(), "command": command, "param": ""}});
-    command_result(p.live.publish(&p.cfg.serial, &payload))
+    send(&p, &payload).await
 }
 
 async fn pause(State(st): State<Shared>, Path(id): Path<String>) -> Response {
@@ -601,6 +716,109 @@ mod tests {
         );
     }
 
+    async fn post_json(app: &Router, uri: &str, body: Value) -> (StatusCode, Value) {
+        let req = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header(header::AUTHORIZATION, "Bearer tok")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        let code = res.status();
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        (code, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    }
+
+    /// Answer the next published command the way `reply` says.
+    fn answer_next(live: Arc<Live>, sent: Arc<std::sync::Mutex<Vec<Value>>>, reply: Value) {
+        tokio::spawn(async move {
+            loop {
+                let last = sent.lock().unwrap().last().cloned();
+                if let Some(req) = last {
+                    let (key, inner) = req.as_object().unwrap().iter().next().unwrap();
+                    let mut r = reply.clone();
+                    r["command"] = inner["command"].clone();
+                    r["sequence_id"] = inner["sequence_id"].clone();
+                    live.dispatch_reply(&json!({ key.clone(): r }));
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+    }
+
+    #[tokio::test]
+    async fn developer_mode_refusal_is_a_409() {
+        let (app, live) = app_with_fake();
+        let sent = live.fake_connected();
+        answer_next(
+            live.clone(),
+            sent.clone(),
+            json!({"result": "failed", "reason": "mqtt message verify failed",
+                "err_code": 84033543u64}),
+        );
+        let (code, body) =
+            post_json(&app, "/printers/p1s/start", json!({"file": "cube.3mf"})).await;
+        assert_eq!(code, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["needs_developer_mode"], true);
+        assert_eq!(body["err_code"], 84033543u64);
+
+        sent.lock().unwrap().clear();
+        answer_next(
+            live.clone(),
+            sent.clone(),
+            json!({"result": "failed", "reason": "busy", "err_code": 1}),
+        );
+        let (code, body) = post_json(
+            &app,
+            "/printers/p1s/command",
+            json!({"type": "light", "on": true}),
+        )
+        .await;
+        assert_eq!(code, StatusCode::BAD_GATEWAY);
+        assert!(body.get("needs_developer_mode").is_none());
+        assert_eq!(sent.lock().unwrap()[0]["system"]["led_mode"], "on");
+
+        sent.lock().unwrap().clear();
+        answer_next(live.clone(), sent.clone(), json!({"result": "success"}));
+        let (code, body) = post_json(&app, "/printers/p1s/command", json!({"type": "home"})).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body, json!({"ok": true, "confirmed": true}));
+    }
+
+    #[tokio::test]
+    async fn command_route_validates_and_refuses_motion_mid_print() {
+        let (app, live) = app_with_fake();
+        let (code, _) = post_json(&app, "/printers/p1s/command", json!({"type": "home"})).await;
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE, "offline");
+        let sent = live.fake_connected();
+        status::apply_report(
+            &mut live.state.lock().unwrap(),
+            &json!({"print": {"command": "push_status", "gcode_state": "RUNNING"}}),
+        );
+        let (code, body) = post_json(
+            &app,
+            "/printers/p1s/command",
+            json!({"type": "jog", "axis": "x", "distance": 5}),
+        )
+        .await;
+        assert_eq!(code, StatusCode::CONFLICT, "{body}");
+        let (code, _) = post_json(&app, "/printers/p1s/command", json!({"type": "warp"})).await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        assert!(sent.lock().unwrap().is_empty(), "nothing published");
+    }
+
+    #[test]
+    fn storage_paths() {
+        assert!(valid_storage_path("a.3mf"));
+        assert!(valid_storage_path("cache/a.3mf"));
+        assert!(!valid_storage_path("../a.3mf"));
+        assert!(!valid_storage_path("cache/../x"));
+        assert!(!valid_storage_path("cache/"));
+        assert!(!valid_storage_path(".."));
+        assert!(!valid_storage_path("/etc/passwd"));
+    }
     #[test]
     fn start_payloads() {
         let p = start_payload(

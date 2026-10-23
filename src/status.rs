@@ -92,6 +92,9 @@ pub struct Spool {
 pub struct Ams {
     pub trays: Vec<AmsTray>,
     pub external: Option<Spool>,
+    /// The spool feeding the toolhead (`tray_now`): a global slot number,
+    /// `"external"`, or `null` (255 = none / unknown).
+    pub active: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -123,6 +126,40 @@ pub struct Status {
     pub message: Option<String>,
     /// `null` when the printer reports no AMS and no external spool.
     pub ams: Option<Ams>,
+    /// Speed profile: 1 silent, 2 standard, 3 sport, 4 ludicrous.
+    pub speed_level: Option<u8>,
+    pub fans: Fans,
+    /// Chamber light, `"on"` / `"off"`.
+    pub light: Option<&'static str>,
+    pub wifi_signal: Option<String>,
+    /// Filled from the `get_version` reply by the HTTP layer.
+    pub firmware: Option<String>,
+    /// `null` unless the printer reports its `fun` bitfield.
+    pub developer_mode: Option<bool>,
+    /// Active HMS errors, then a nonzero `print_error`.
+    pub errors: Vec<PrinterError>,
+}
+
+/// Fan speeds in percent; absent fans are omitted.
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+pub struct Fans {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub part: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aux: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chamber: Option<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct PrinterError {
+    /// `0500_0500_0001_0007` (HMS) or `0502_4007` (print_error).
+    pub code: String,
+    /// Known description, else `null` (see `url`).
+    pub text: Option<String>,
+    pub severity: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
 }
 
 /// Numbers arrive as JSON numbers or numeric strings depending on field and
@@ -233,7 +270,19 @@ fn ams(p: &Value) -> Option<Ams> {
             color: non_empty_str(v, "tray_color"),
         })
     });
-    (!trays.is_empty() || external.is_some()).then_some(Ams { trays, external })
+    let active = block
+        .and_then(|a| num(a, "tray_now"))
+        .and_then(|n| match n as u64 {
+            255 => None,
+            254 => Some(Value::from("external")),
+            s if s < 64 => Some(Value::from(s)),
+            _ => None,
+        });
+    (!trays.is_empty() || external.is_some()).then_some(Ams {
+        trays,
+        external,
+        active,
+    })
 }
 
 /// Normalise the cached `print` state into the bridge's status shape.
@@ -285,7 +334,117 @@ pub fn normalise(p: &Value, connected: bool, now_s: u64) -> Status {
         temps,
         message: message(p),
         ams: ams(p),
+        speed_level: num(p, "spd_lvl")
+            .map(|n| n as u8)
+            .filter(|n| (1..=4).contains(n)),
+        fans: Fans {
+            part: fan_pct(p, "cooling_fan_speed"),
+            aux: fan_pct(p, "big_fan1_speed"),
+            chamber: fan_pct(p, "big_fan2_speed"),
+        },
+        light: light(p),
+        wifi_signal: non_empty_str(p, "wifi_signal"),
+        firmware: None,
+        developer_mode: developer_mode(p),
+        errors: errors(p),
     }
+}
+
+/// Bambu fan speeds are 0-15 steps (numbers or numeric strings) → percent.
+fn fan_pct(p: &Value, key: &str) -> Option<u8> {
+    num(p, key).map(|v| ((v.clamp(0.0, 15.0) / 15.0) * 100.0).round() as u8)
+}
+
+fn light(p: &Value) -> Option<&'static str> {
+    let lights = p.get("lights_report")?.as_array()?;
+    let chamber = lights
+        .iter()
+        .find(|l| l.get("node").and_then(Value::as_str) == Some("chamber_light"))?;
+    match chamber.get("mode").and_then(Value::as_str)? {
+        "on" | "flashing" => Some("on"),
+        "off" => Some("off"),
+        _ => None,
+    }
+}
+
+/// `fun` bit 29 means the printer requires signed MQTT commands (as
+/// ha-bambulab reads it): Developer Mode is off. `None` when not reported.
+fn developer_mode(p: &Value) -> Option<bool> {
+    let fun = hex_bits(p, "fun")?;
+    Some(fun & 0x2000_0000 == 0)
+}
+
+/// Built-in descriptions for the codes we know how to explain.
+const KNOWN_ERRORS: [(&str, &str); 4] = [
+    (
+        "0500_0500_0001_0007",
+        "MQTT command verification failed — enable LAN Only + Developer Mode on the printer",
+    ),
+    (
+        "0502_4007",
+        "Printer refused an unsigned command — enable LAN Only + Developer Mode on the printer",
+    ),
+    (
+        "0502_4009",
+        "Printer refused a command with a malformed signature — enable LAN Only + Developer Mode on the printer",
+    ),
+    ("0300_400C", "The print was cancelled"),
+];
+
+fn known_text(code: &str) -> Option<String> {
+    KNOWN_ERRORS
+        .iter()
+        .find(|(c, _)| *c == code)
+        .map(|(_, t)| (*t).to_owned())
+}
+
+/// HMS severity from the high word of `code` (Bambu: 1 fatal, 2 serious,
+/// 3 common, 4 info).
+fn hms_severity(code: u64) -> &'static str {
+    match (code >> 16) & 0xFFFF {
+        1 => "fatal",
+        2 => "serious",
+        3 => "common",
+        4 => "info",
+        _ => "unknown",
+    }
+}
+
+fn errors(p: &Value) -> Vec<PrinterError> {
+    let mut out = Vec::new();
+    if let Some(hms) = p.get("hms").and_then(Value::as_array) {
+        for h in hms {
+            let (Some(attr), Some(code)) = (num(h, "attr"), num(h, "code")) else {
+                continue;
+            };
+            let (attr, code) = (attr as u64, code as u64);
+            let id = format!(
+                "{:04X}_{:04X}_{:04X}_{:04X}",
+                (attr >> 16) & 0xFFFF,
+                attr & 0xFFFF,
+                (code >> 16) & 0xFFFF,
+                code & 0xFFFF
+            );
+            out.push(PrinterError {
+                text: known_text(&id),
+                url: Some(format!(
+                    "https://wiki.bambulab.com/en/x1/troubleshooting/hmscode/{id}"
+                )),
+                code: id,
+                severity: hms_severity(code),
+            });
+        }
+    }
+    if let Some(code) = num(p, "print_error").map(|c| c as u64).filter(|c| *c != 0) {
+        let id = fmt_error(code);
+        out.push(PrinterError {
+            text: known_text(&id),
+            url: None,
+            code: id,
+            severity: "serious",
+        });
+    }
+    out
 }
 
 #[cfg(test)]
@@ -546,5 +705,87 @@ mod tests {
             &json!({"print": {"command": "push_status", "vt_tray": {"tray_type": ""}}}),
         );
         assert_eq!(normalise(&state, true, 0).ams.unwrap().external, None);
+    }
+
+    #[test]
+    fn control_fields_and_errors() {
+        let mut state = Value::Null;
+        apply_report(&mut state, &full_report());
+        apply_report(
+            &mut state,
+            &json!({"print": {"command": "push_status", "spd_lvl": 2,
+                "cooling_fan_speed": "15", "big_fan1_speed": "0", "big_fan2_speed": "10",
+                "wifi_signal": "-48dBm", "fun": "3EC1AFFF9CFF",
+                "print_error": 0x0502_4007u64,
+                "hms": [{"attr": 0x0500_0500u64, "code": 0x0001_0007u64},
+                        {"attr": 0x0700_2000u64, "code": 0x0002_0001u64}]}}),
+        );
+        let s = normalise(&state, true, 0);
+        assert_eq!(s.speed_level, Some(2));
+        assert_eq!(
+            s.fans,
+            Fans {
+                part: Some(100),
+                aux: Some(0),
+                chamber: Some(67)
+            }
+        );
+        assert_eq!(s.light, Some("on"));
+        assert_eq!(s.wifi_signal.as_deref(), Some("-48dBm"));
+        assert_eq!(
+            s.developer_mode,
+            Some(false),
+            "bit 29 set: signing required"
+        );
+        assert_eq!(s.errors.len(), 3);
+        assert_eq!(s.errors[0].code, "0500_0500_0001_0007");
+        assert!(
+            s.errors[0]
+                .text
+                .as_deref()
+                .unwrap()
+                .contains("Developer Mode")
+        );
+        assert_eq!(s.errors[0].severity, "fatal");
+        assert_eq!(s.errors[1].text, None);
+        assert_eq!(
+            s.errors[1].url.as_deref(),
+            Some("https://wiki.bambulab.com/en/x1/troubleshooting/hmscode/0700_2000_0002_0001")
+        );
+        assert_eq!(s.errors[2].code, "0502_4007");
+        assert!(s.errors[2].text.is_some());
+
+        let s = normalise(&json!({"fun": "8FFF9CFF"}), true, 0);
+        assert_eq!(s.developer_mode, Some(true));
+        let v = serde_json::to_value(normalise(&json!({}), true, 0)).unwrap();
+        assert_eq!(v["developer_mode"], Value::Null);
+        assert_eq!(v["fans"], json!({}));
+        assert_eq!(v["errors"], json!([]));
+        assert_eq!(v["light"], Value::Null);
+    }
+    #[test]
+    fn active_tray_from_tray_now() {
+        let mut state = Value::Null;
+        apply_report(&mut state, &ams_report());
+        assert_eq!(
+            normalise(&state, true, 0).ams.unwrap().active,
+            None,
+            "255 = none"
+        );
+        for (raw, want) in [("2", json!(2)), ("254", json!("external"))] {
+            apply_report(
+                &mut state,
+                &json!({"print": {"command": "push_status", "ams": {"tray_now": raw}}}),
+            );
+            let v = serde_json::to_value(normalise(&state, true, 0)).unwrap();
+            assert_eq!(v["ams"]["active"], want, "{raw}");
+        }
+        // P1S without the fun field: developer_mode stays unknown.
+        let p1s = json!({"home_flag": 24330512, "wifi_signal": "-44dBm", "spd_lvl": 2,
+            "cooling_fan_speed": "0", "print_error": 0, "hms": []});
+        let s = normalise(&p1s, true, 0);
+        assert_eq!(s.developer_mode, None);
+        assert_eq!((s.speed_level, s.fans.part), (Some(2), Some(0)));
+        assert!(s.errors.is_empty());
     }
 }

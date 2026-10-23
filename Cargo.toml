@@ -1,6 +1,6 @@
 [package]
 name = "print-bridge"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2024"
 description = "Local HTTP bridge for Bambu Lab printers in LAN mode (MQTT/FTPS/camera)."
 license = "MIT"
