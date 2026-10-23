@@ -10,13 +10,19 @@ use serde_json::{Map, Value};
 
 /// Deep-merge `delta` into `base`: objects merge key by key, everything else
 /// (scalars, arrays) replaces. Arrays replace wholesale — `hms` in particular
-/// must be able to shrink back to `[]` once an error is cleared.
+/// must be able to shrink back to `[]` once an error is cleared. The AMS
+/// unit list (`ams.ams`) and each unit's `tray` list are the exception: P1/A1
+/// deltas carry only the units/trays (and fields) that changed, so those
+/// merge element by element on their `id`.
 pub fn merge(base: &mut Value, delta: &Value) {
     match (base, delta) {
         (Value::Object(b), Value::Object(d)) => {
             for (k, v) in d {
                 match b.get_mut(k) {
                     Some(existing) if existing.is_object() && v.is_object() => merge(existing, v),
+                    Some(Value::Array(existing)) if (k == "ams" || k == "tray") && v.is_array() => {
+                        merge_by_id(existing, v.as_array().unwrap());
+                    }
                     _ => {
                         b.insert(k.clone(), v.clone());
                     }
@@ -24,6 +30,21 @@ pub fn merge(base: &mut Value, delta: &Value) {
             }
         }
         (b, d) => *b = d.clone(),
+    }
+}
+
+/// Merge `delta` elements into `base` by their `id`; new ids append, ids
+/// absent from `delta` are kept. Elements without an id replace by position.
+fn merge_by_id(base: &mut Vec<Value>, delta: &[Value]) {
+    for (i, d) in delta.iter().enumerate() {
+        let pos = match d.get("id") {
+            Some(id) => base.iter().position(|b| b.get("id") == Some(id)),
+            None => (i < base.len()).then_some(i),
+        };
+        match pos {
+            Some(p) => merge(&mut base[p], d),
+            None => base.push(d.clone()),
+        }
     }
 }
 
@@ -44,6 +65,33 @@ pub fn apply_report(state: &mut Value, report: &Value) -> bool {
     }
     merge(state, print);
     true
+}
+
+/// One loaded AMS tray. `slot` is the global tray index Bambu's
+/// `ams_mapping` uses (`unit * 4 + tray`).
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct AmsTray {
+    pub slot: u32,
+    pub unit: u32,
+    pub tray: u32,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub color: Option<String>,
+}
+
+/// The external spool holder (`vt_tray`).
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct Spool {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub color: Option<String>,
+}
+
+/// Loaded filament: AMS trays (empty trays omitted) and the external spool.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct Ams {
+    pub trays: Vec<AmsTray>,
+    pub external: Option<Spool>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -73,6 +121,8 @@ pub struct Status {
     pub total_layers: Option<u64>,
     pub temps: Temps,
     pub message: Option<String>,
+    /// `null` when the printer reports no AMS and no external spool.
+    pub ams: Option<Ams>,
 }
 
 /// Numbers arrive as JSON numbers or numeric strings depending on field and
@@ -127,6 +177,64 @@ fn message(p: &Value) -> Option<String> {
     }
     (!parts.is_empty()).then(|| parts.join("; "))
 }
+/// Bambu bitmasks (`ams_exist_bits`, `tray_exist_bits`) arrive as hex strings.
+fn hex_bits(v: &Value, key: &str) -> Option<u64> {
+    match v.get(key)? {
+        Value::String(s) => u64::from_str_radix(s.trim(), 16).ok(),
+        Value::Number(n) => n.as_u64(),
+        _ => None,
+    }
+}
+
+fn index(v: &Value) -> Option<u32> {
+    num(v, "id").map(|n| n as u32)
+}
+
+/// Loaded filament from the cached state. A tray counts as loaded when it
+/// reports a `tray_type` and, when the printer sends `tray_exist_bits`, its
+/// bit is set — merged deltas can leave a stale type on an emptied tray.
+fn ams(p: &Value) -> Option<Ams> {
+    let block = p.get("ams");
+    let unit_bits = block.and_then(|a| hex_bits(a, "ams_exist_bits"));
+    let tray_bits = block.and_then(|a| hex_bits(a, "tray_exist_bits"));
+    let mut trays = Vec::new();
+    let units = block
+        .and_then(|a| a.get("ams"))
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    for u in units {
+        let Some(unit) = index(u) else { continue };
+        if unit_bits.is_some_and(|b| unit >= 64 || b & (1 << unit) == 0) {
+            continue;
+        }
+        let unit_trays = u.get("tray").and_then(Value::as_array);
+        for t in unit_trays.map(Vec::as_slice).unwrap_or_default() {
+            let (Some(tray), Some(kind)) = (index(t), non_empty_str(t, "tray_type")) else {
+                continue;
+            };
+            let slot = unit * 4 + tray;
+            if tray_bits.is_some_and(|b| slot >= 64 || b & (1 << slot) == 0) {
+                continue;
+            }
+            trays.push(AmsTray {
+                slot,
+                unit,
+                tray,
+                kind,
+                color: non_empty_str(t, "tray_color"),
+            });
+        }
+    }
+    trays.sort_by_key(|t| t.slot);
+    let external = p.get("vt_tray").and_then(|v| {
+        Some(Spool {
+            kind: non_empty_str(v, "tray_type")?,
+            color: non_empty_str(v, "tray_color"),
+        })
+    });
+    (!trays.is_empty() || external.is_some()).then_some(Ams { trays, external })
+}
 
 /// Normalise the cached `print` state into the bridge's status shape.
 /// `connected` is the MQTT link state; `now_s` is the current unix time
@@ -176,6 +284,7 @@ pub fn normalise(p: &Value, connected: bool, now_s: u64) -> Status {
         total_layers,
         temps,
         message: message(p),
+        ams: ams(p),
     }
 }
 
@@ -349,5 +458,93 @@ mod tests {
         let s = normalise(&failed, true, 0);
         assert_eq!(s.state, "error");
         assert_eq!(s.message.as_deref(), Some("print_error 0300_400C"));
+    }
+
+    /// The user's P1S: one AMS with four PLA trays, ASA on the external spool.
+    fn ams_report() -> Value {
+        let tray = |id: &str, ty: &str, color: &str| json!({"id": id, "tray_type": ty, "tray_color": color, "remain": 80});
+        json!({"print": {
+            "command": "push_status",
+            "ams": {
+                "ams_exist_bits": "1",
+                "tray_exist_bits": "f",
+                "tray_now": "255",
+                "ams": [{"id": "0", "humidity": "4", "tray": [
+                    tray("0", "PLA", "FF9016FF"),
+                    tray("1", "PLA", "F7E6DEFF"),
+                    tray("2", "PLA", "161616FF"),
+                    tray("3", "PLA", "E8DBB7FF"),
+                ]}]
+            },
+            "vt_tray": {"id": "254", "tray_type": "ASA", "tray_color": "FFFFFFFF"}
+        }})
+    }
+
+    #[test]
+    fn ams_trays_and_external_spool() {
+        let mut state = Value::Null;
+        apply_report(&mut state, &ams_report());
+        let a = normalise(&state, true, 0).ams.expect("ams");
+        assert_eq!(a.trays.len(), 4);
+        assert_eq!(
+            a.trays[2],
+            AmsTray {
+                slot: 2,
+                unit: 0,
+                tray: 2,
+                kind: "PLA".into(),
+                color: Some("161616FF".into())
+            }
+        );
+        assert_eq!(a.external.as_ref().unwrap().kind, "ASA");
+        let v = serde_json::to_value(normalise(&state, true, 0)).unwrap();
+        assert_eq!(
+            v["ams"]["trays"][0],
+            json!({"slot": 0, "unit": 0, "tray": 0, "type": "PLA", "color": "FF9016FF"})
+        );
+        assert_eq!(v["ams"]["external"]["type"], "ASA");
+        // No AMS, no external spool: null.
+        assert_eq!(normalise(&json!({}), true, 0).ams, None);
+    }
+
+    #[test]
+    fn ams_survives_partial_deltas() {
+        let mut state = Value::Null;
+        apply_report(&mut state, &ams_report());
+        // A delta without the ams block leaves it alone.
+        apply_report(
+            &mut state,
+            &json!({"print": {"command": "push_status", "mc_percent": 3}}),
+        );
+        assert_eq!(normalise(&state, true, 0).ams.unwrap().trays.len(), 4);
+        // P1 delta: only tray 1 changed, and only some of its fields.
+        apply_report(
+            &mut state,
+            &json!({"print": {"command": "push_status", "ams": {"ams": [{"id": "0",
+                "tray": [{"id": "1", "tray_type": "PETG", "tray_color": "00FF00FF"}]}]}}}),
+        );
+        let a = normalise(&state, true, 0).ams.unwrap();
+        assert_eq!(a.trays.len(), 4, "other trays survive");
+        assert_eq!(a.trays[1].kind, "PETG");
+        assert_eq!(a.trays[0].color.as_deref(), Some("FF9016FF"));
+        assert_eq!(state["ams"]["ams"][0]["humidity"], "4", "unit fields kept");
+        assert_eq!(state["ams"]["ams"][0]["tray"][1]["remain"], 80);
+        // Tray 3 unloaded: its exist bit clears though the stale type stays.
+        apply_report(
+            &mut state,
+            &json!({"print": {"command": "push_status", "ams": {"tray_exist_bits": "7",
+                "ams": [{"id": "0", "tray": [{"id": "3"}]}]}}}),
+        );
+        let a = normalise(&state, true, 0).ams.unwrap();
+        assert_eq!(
+            a.trays.iter().map(|t| t.slot).collect::<Vec<_>>(),
+            [0, 1, 2]
+        );
+        // Empty external spool reports an empty type.
+        apply_report(
+            &mut state,
+            &json!({"print": {"command": "push_status", "vt_tray": {"tray_type": ""}}}),
+        );
+        assert_eq!(normalise(&state, true, 0).ams.unwrap().external, None);
     }
 }

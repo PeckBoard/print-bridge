@@ -127,7 +127,11 @@ asynchronously — watch `/status` for the effect.
     "bed": { "actual": 54.9, "target": 55.0 },
     "chamber": { "actual": 31.0, "target": null }
   },
-  "message": null
+  "message": null,
+  "ams": {
+    "trays": [{ "slot": 0, "unit": 0, "tray": 0, "type": "PLA", "color": "FF9016FF" }],
+    "external": { "type": "ASA", "color": "FFFFFFFF" }
+  }
 }
 ```
 
@@ -144,6 +148,13 @@ asynchronously — watch `/status` for the effect.
   no chamber sensor).
 - `message`: `print_error` as `print_error XXXX_XXXX` and each HMS entry as
   `HMS_XXXX_XXXX_XXXX_XXXX` (searchable on the Bambu wiki), `; `-joined.
+  `HMS_XXXX_XXXX_XXXX_XXXX` (searchable on the Bambu wiki), `; `-joined.
+- `ams`: loaded spools, or `null` with no AMS and no external spool.
+  `trays` lists loaded AMS trays (empty ones omitted: no `tray_type`, or its
+  bit clear in `tray_exist_bits`); `slot` = `unit * 4 + tray`, the index
+  `ams_mapping` uses. `external` is the `vt_tray` spool. P1/A1 deltas carry
+  only changed units/trays, so `ams.ams[]` and each unit's `tray[]` merge by
+  `id` instead of replacing.
 
 ### Example
 
