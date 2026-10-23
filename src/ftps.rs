@@ -58,9 +58,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Control<S> {
     }
 
     async fn cmd(&mut self, line: &str, expect: &[u16]) -> anyhow::Result<String> {
+        // One write = one TLS record. The printer's FTP server parses each
+        // record as a whole command: `PASS x` and `\r\n` sent separately get
+        // a bare `332` instead of `230`.
         let w = self.io.get_mut();
-        w.write_all(line.as_bytes()).await?;
-        w.write_all(b"\r\n").await?;
+        w.write_all(format!("{line}\r\n").as_bytes()).await?;
         w.flush().await?;
         let (code, text) = self.reply().await?;
         if !expect.contains(&code) {
@@ -193,6 +195,64 @@ mod tests {
         let (code, text) = ctl.reply().await.unwrap();
         assert_eq!(code, 230);
         assert!(text.ends_with("230 Login successful."));
+    }
+
+    /// Records each `poll_write` call and answers every command with `230`.
+    #[derive(Default)]
+    struct Writes {
+        writes: Vec<Vec<u8>>,
+        replies: std::collections::VecDeque<u8>,
+    }
+
+    impl AsyncWrite for Writes {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.writes.push(buf.to_vec());
+            self.replies.extend(b"230 \r\n");
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncRead for Writes {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            while buf.remaining() > 0 {
+                let Some(b) = self.replies.pop_front() else {
+                    break;
+                };
+                buf.put_slice(&[b]);
+            }
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// The P1S FTP server treats each TLS record as a complete command, so a
+    /// command and its CRLF must go out in one write.
+    #[tokio::test]
+    async fn command_and_crlf_are_one_write() {
+        let mut ctl = Control {
+            io: BufReader::new(Writes::default()),
+        };
+        ctl.cmd("PASS 12345678", &[230]).await.unwrap();
+        assert_eq!(ctl.io.get_ref().writes, vec![b"PASS 12345678\r\n".to_vec()]);
     }
 
     /// Fake implicit-FTPS server with vsftpd's `require_ssl_reuse`: the
